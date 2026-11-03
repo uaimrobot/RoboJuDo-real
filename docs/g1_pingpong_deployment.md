@@ -277,6 +277,8 @@ policy present the OTHER face (normal 160 deg off, reproducible); the default an
 Every stop on the robot is RoboJuDo's guard stop: **legs and waist go limp at once (damped), the arms brace in the guard pose. The
 robot falls unless the gantry or rope holds it** (in MuJoCo the pelvis drops from 0.79 to 0.39 m in 1.5 s). The control loop carries
 the guard out, so after a stop the player keeps running and holds it **until Ctrl-C**; then it ends and the motors are released.
+With `--log`, the record is written the moment the stop begins (on a thread, the stepping goes on) and again, whole, when the program
+ends: a player that is killed instead of ended with that second Ctrl-C still leaves its log in `logs/pingpong/`.
 
 | what stops | when |
 |---|---|

@@ -21,7 +21,7 @@ itself, so after a stop this program keeps the loop running, holding it, until C
 (env.shutdown). What stops it:
     the remote: A, Select or Start (triggers in g1_pingpong_real) - during play and during the start-up ramp and blend (read from
                 the robot's raw remote state there: RoboJuDo's prepare() does not read the remote in its ramp)
-    Ctrl-C      in the terminal (a second Ctrl-C then ends the program)
+    Ctrl-C      in the terminal (a second Ctrl-C then ends the program; --log's file is written at the stop and again at the end)
     watchdogs   no fresh pelvis pose from perception for --stale-steps control steps; pelvis below 0.45 m or tilted more than
                 --max-tilt-deg; a NaN in the targets
 A stop needs this program running: if it is killed or hangs, the last command stays. Unitree's own stop (power) is the last resort.
@@ -50,6 +50,7 @@ import argparse
 import json
 import logging
 import sys
+import threading
 import time
 
 import struct
@@ -234,13 +235,18 @@ def prepare_watching_stops(pipeline, env, triggers, prepare_seconds):
             del env.step
 
 
-def hold_guard(pipeline, env, dt, reason):
+def hold_guard(pipeline, env, dt, reason, on_hold=None):
     """After a stop on the robot: arm RoboJuDo's guard stop (unless a stop command already did) and keep stepping the env, which carries
-    it out (legs limp and damped, arms to the guard pose and held), until Ctrl-C."""
+    it out (legs limp and damped, arms to the guard pose and held), until Ctrl-C. on_hold: called once the guard is armed (RunLog.start)."""
     if getattr(env, "_guard_ramp", None) is None:
         pipeline.stop_with_guard_pose(reason)
     logger.error(f"STOPPED ({reason}): legs limp and damped, arms in the guard pose, held. Ctrl-C to end the program "
                  "(the motors are then released).")
+    if on_hold is not None:
+        try:
+            on_hold()
+        except Exception:  # whatever it does, the hold goes on
+            logger.exception("on_hold failed")
     try:
         while True:
             t0 = time.perf_counter()
@@ -268,6 +274,58 @@ def log_path(name, kind):
         path = os.path.join(LOG_DIR, name)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     return path
+
+
+def _json_default(o):
+    """json.dump's fallback: numpy scalars as floats (as before), arrays as lists (one stray array must not cost the whole record)."""
+    return o.tolist() if getattr(o, "ndim", 0) else float(o)
+
+
+class RunLog:
+    """--log's record. build() copies the run's state so far into a plain dict (.json: meta/results/shots; .npz: the per-step lists).
+    start() writes it on a thread when a stop begins: the hold state keeps stepping (which carries out the guard), and a program that is
+    killed instead of ended with the second Ctrl-C still leaves its record. finish() writes it again, whole, when the program ends."""
+
+    def __init__(self, path, build):
+        self.path, self.build, self.threads = path, build, []
+
+    def _write(self, payload):
+        tmp = f"{self.path}.{threading.get_ident()}.tmp"  # written whole, then renamed: a kill never leaves half a file
+        if self.path.endswith(".json"):
+            with open(tmp, "w") as f:
+                json.dump(payload, f, default=_json_default)
+        else:
+            with open(tmp, "wb") as f:  # (a file object: np.savez adds ".npz" to a name)
+                np.savez(f, **{k: np.array(v) for k, v in payload.items()})
+        os.replace(tmp, self.path)
+
+    def start(self):
+        try:
+            payload = self.build()
+        except Exception:
+            logger.exception("--log: could not copy the run's record")
+            return
+
+        def run():
+            try:
+                self._write(payload)
+            except Exception:
+                logger.exception(f"--log: could not write {self.path}")
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        self.threads.append(t)
+        logger.info(f"[player] --log: the record so far is being written to {self.path} (written again when the program ends)")
+
+    def finish(self):
+        for t in self.threads:
+            t.join(timeout=10.0)
+        try:
+            self._write(self.build())
+            return True
+        except Exception:
+            logger.exception(f"--log: could not write {self.path}")
+            return False
 
 
 def main():
@@ -473,6 +531,19 @@ def main():
     n_reported = 0
     script_said = False
     t_next = time.perf_counter()
+
+    def build_log():
+        if not a.log.endswith(".json"):
+            return {k: list(v) for k, v in rec.items()}
+        meta = dict(config=a.config, sim=sim, dry_run=a.dry_run, checkpoint=str(cfg.policy.checkpoint), cam_hz=cfg.policy.cam_hz,
+                    date=time.strftime("%Y-%m-%d %H:%M:%S"), stop=stop_reason, n_busy=policy.rt.n_busy,
+                    ball_noise_m=cfg.policy.noise, racket_z_offset_m=cfg.policy.racket_z_offset,
+                    paddle_extra_mass_kg=getattr(cfg.env, "paddle_extra_mass", None) if sim else None,
+                    script_plans=cfg.policy.script_plans, manual_port=cfg.policy.manual_port)
+        return dict(meta=meta, results=list(env.results) if sim else [], shots=list(policy.rt.shots))
+
+    run_log = RunLog(a.log, build_log) if a.log else None
+    on_hold = run_log.start if run_log else None
     try:
         while True:
             pipeline.step(dry_run=a.dry_run)
@@ -525,7 +596,7 @@ def main():
             if stop_reason:
                 logger.error(f"STOP: {stop_reason}")
                 if not a.dry_run and not sim:  # the guard is carried out by stepping: hold it until Ctrl-C
-                    hold_guard(pipeline, env, dt, stop_reason)
+                    hold_guard(pipeline, env, dt, stop_reason, on_hold)
                 break
             if a.script_plans and policy.rt.script_done and not script_said:
                 script_said = True
@@ -561,13 +632,14 @@ def main():
     except KeyboardInterrupt:
         logger.warning("interrupted")
         if not sim and not a.dry_run:
-            hold_guard(pipeline, env, dt, "Ctrl-C")
+            hold_guard(pipeline, env, dt, "Ctrl-C", on_hold)
     except Exception as e:  # a bug in the loop with torque on: the guard stop, as for any stop (then the error is shown)
         if not sim and not a.dry_run:
             logger.exception("error in the control loop")
-            hold_guard(pipeline, env, dt, f"error: {e!r}")
+            hold_guard(pipeline, env, dt, f"error: {e!r}", on_hold)
         raise
     finally:
+        log_ok = run_log.finish() if run_log else False  # first: nothing below may keep the record from being written
         wall = time.perf_counter() - t_wall0
         logger.info(f"{n} control steps in {wall:.1f} s wall ({n * dt:.1f} s of control); late steps {drops}")
         timer.report(dt * 1000.0)
@@ -585,16 +657,7 @@ def main():
                 print(f"perception messages {perc.n_msgs}; lockstep timeouts {perc.n_lockstep_timeouts}")
             print(f"perception messages used {rt.n_frames}; detected shots {len(rt.shots)}; swings: {[s.get('swing') for s in rt.shots]}; "
                   f"shots while busy {rt.n_busy}; dry-run style torque excess steps (joints): {int((monitor.torque_over > 0).sum())}")
-        if a.log:
-            if a.log.endswith(".json"):
-                meta = dict(config=a.config, sim=sim, dry_run=a.dry_run, checkpoint=str(cfg.policy.checkpoint), cam_hz=cfg.policy.cam_hz,
-                            date=time.strftime("%Y-%m-%d %H:%M:%S"), stop=stop_reason, n_busy=policy.rt.n_busy,
-                            ball_noise_m=cfg.policy.noise, racket_z_offset_m=cfg.policy.racket_z_offset,
-                            paddle_extra_mass_kg=getattr(cfg.env, "paddle_extra_mass", None) if sim else None,
-                            script_plans=cfg.policy.script_plans, manual_port=cfg.policy.manual_port)
-                json.dump(dict(meta=meta, results=env.results if sim else [], shots=policy.rt.shots), open(a.log, "w"), default=float)
-            else:
-                np.savez(a.log, **{k: np.array(v) for k, v in rec.items()})
+        if log_ok:
             print(f"-> {a.log}")
         env.shutdown()
 
