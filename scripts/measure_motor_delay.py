@@ -1,24 +1,28 @@
 """B7: the G1's motor delay, joint by joint. Small steps and a short sine sweep on one joint at a time (all others hold the swing
-library's ready pose), the joint angle recorded at 200 Hz. Per joint: dead time (command to 10 % of the step), t63, overshoot, the share
-of the step reached, and the sine's gain and delay at 1-5 Hz. Run the same in MuJoCo for the reference: the difference is the robot's
-extra delay (the policy, fix6-7, was trained with 0-20 ms).
+library's ready pose), the joint angle and the motor's torque recorded at 200 Hz. Per joint: first motion (command to 2 mrad of motion),
+dead time (command to 10 % of the step), t63, overshoot, the share of the step reached, the sine's gain and delay at 1-5 Hz, and at rest the
+torque the gains ask for (kp x error) against the torque the motor reports (tau_est). Run the same in MuJoCo for the reference: the
+difference in first motion is the robot's extra delay (the policy, fix6-7, was trained with 0-20 ms). Read the delay from first motion:
+friction holds a joint back on small steps, which stretches dead time and t63 and bends the sine's delay.
 
     python scripts/measure_motor_delay.py -c g1_pingpong_real --dry-run              # the plan; no torque
     python scripts/measure_motor_delay.py -c g1_pingpong_real --joints arms --log    # the robot, ~1.5 min
     python scripts/measure_motor_delay.py -c g1_pingpong_real --joints legs waist --log
+    python scripts/measure_motor_delay.py -c g1_pingpong_real --joints ankles --log  # the ankles alone (pitch and roll), ~1 min
     python scripts/measure_motor_delay.py -c g1_pingpong --joints all --log          # the simulation reference (logs/pingpong-sim/)
     python scripts/measure_motor_delay.py -c g1_pingpong_real --joints arms --log --compare <sim log>.json
 
 The robot HANGS from the gantry, feet at least 5 cm off the floor (the legs then carry no load: the motors' and the link's own delay is
-what is measured; in simulation the pelvis is held in the air the same way). The gains are the policy's (PingPongDoF: training's kp, kd,
-torque limits). Targets are sent at 200 Hz but change at 50 Hz, as the policy's. Steps are 0.10 rad (--amp, at most 0.15), and a side
+what is measured; in simulation the torso is held in the air the same way, SimHang, and gravity loads what hangs from it). The gains are
+the policy's (PingPongDoF: training's kp, kd, torque limits). Targets are sent at 200 Hz but change at 50 Hz, as the policy's. Steps are 0.10 rad (--amp, at most 0.15), and a side
 that would come within 0.05 rad of the joint's limit is skipped.
 
 Stops, as the player's: the remote's stop buttons (held 40 ms), Ctrl-C, or an error -> RoboJuDo's guard stop (legs limp and damped,
 arms to the guard pose), held until Ctrl-C; then the motors are released. At the end the ready pose is held until Ctrl-C.
 
-The log (--log): per joint the command and angle series and the results, plus the robot state's field names (motor temperatures and
-battery voltage are recorded if the state has them: their names are not known here, so they are looked up, not assumed).
+The log (--log): per joint the command, angle and torque series and the results, every joint's target, angle and torque at rest before the
+test (meta.rest), plus the robot state's field names (motor temperatures and battery voltage are recorded if the state has them: their
+names are not known here, so they are looked up, not assumed).
 """
 
 import argparse
@@ -46,13 +50,15 @@ GROUPS = {
              "right_ankle_pitch_joint"],
     "waist": ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"],
 }
-GROUPS["all"] = GROUPS["arms"] + GROUPS["legs"] + GROUPS["waist"]
+GROUPS["ankles"] = ["left_ankle_pitch_joint", "right_ankle_pitch_joint", "left_ankle_roll_joint", "right_ankle_roll_joint"]
+GROUPS["all"] = GROUPS["arms"] + GROUPS["legs"] + GROUPS["waist"] + GROUPS["ankles"]
 
 LOOP_DT = 0.005  # s: 200 Hz sampling and sending
 CMD_EVERY = 4  # loops per target change: 50 Hz, the policy's rate
 SETTLE, STEP_HOLD = 0.5, 0.6  # s
 FREQS, CYCLES = (1.0, 2.0, 3.0, 4.0, 5.0), 3  # the sine sweep (the first cycle of each is not analysed: its start is a kink)
 AMP_MAX, LIMIT_MARGIN = 0.15, 0.05  # rad
+MOVE_RAD = 0.002  # the first motion: this far from where the joint was, toward the step (the encoders' noise is under 0.5 mrad)
 STOP_HELD = 8  # loops (40 ms): one corrupted radio packet does not stop
 
 
@@ -87,10 +93,12 @@ def offset_at(pieces, t):
     return 0.0
 
 
-def analyse(t, cmd, q, segs):
-    """Per step: dead time and t63 (ms after the command changed), overshoot and the share of the step reached at the end of the hold;
-    per sine frequency: gain and delay (ms) of the angle against the command, from a sinusoid fit on the analysed cycles."""
+def analyse(t, cmd, q, segs, tau=None, kp=0.0):
+    """Per step: first motion, dead time and t63 (ms after the command changed), overshoot and the share of the step reached at the end of
+    the hold, and with tau (the motor's torque) both torques at the end of the hold; per sine frequency: gain and delay (ms) of the angle
+    against the command, from a sinusoid fit on the analysed cycles."""
     t, cmd, q = map(np.asarray, (t, cmd, q))
+    tau = None if tau is None else np.asarray(tau)
     steps, sines = [], []
     for s in segs:
         if s["kind"] == "step":
@@ -106,8 +114,12 @@ def analyse(t, cmd, q, segs):
             r = (q[m] - np.median(q[before])) / s["delta"]
             tt = t[m] - tc
             first = lambda x: float(tt[np.argmax(r >= x)] * 1000) if (r >= x).any() else np.nan  # noqa: E731
-            steps.append(dict(dead_ms=first(0.1), t63_ms=first(0.63), overshoot=float(r.max() - 1.0),
-                              reached=float(np.median(r[tt >= tt[-1] - 0.2]))))
+            last = tt >= tt[-1] - 0.2
+            step = dict(move_ms=first(MOVE_RAD / abs(s["delta"])), dead_ms=first(0.1), t63_ms=first(0.63), overshoot=float(r.max() - 1.0),
+                        reached=float(np.median(r[last])))
+            if tau is not None:
+                step.update(kp_err=float(kp * np.median(cmd[m][last] - q[m][last])), tau=float(np.median(tau[m][last])))
+            steps.append(step)
         else:
             m = (t >= s["t0"]) & (t < s["t1"])
             if m.sum() < 10:
@@ -123,8 +135,11 @@ def analyse(t, cmd, q, segs):
 
 
 def summary(steps, sines):
-    med = lambda k, L: float(np.nanmedian([x[k] for x in L])) if L else np.nan  # noqa: E731
-    return dict(dead_ms=med("dead_ms", steps), t63_ms=med("t63_ms", steps), overshoot=med("overshoot", steps),
+    def med(k, L):
+        v = [x[k] for x in L if np.isfinite(x[k])]  # (a joint that never moved has no times at all)
+        return float(np.median(v)) if v else np.nan
+
+    return dict(move_ms=med("move_ms", steps), dead_ms=med("dead_ms", steps), t63_ms=med("t63_ms", steps), overshoot=med("overshoot", steps),
                 reached=med("reached", steps), sine_delay_ms=med("delay_ms", sines), sine_gain=med("gain", sines))
 
 
@@ -152,40 +167,79 @@ def state_fields(env):
     return out
 
 
-class Runner:
-    """Drives the env at LOOP_DT with a target vector, watching the stops (the robot) and holding the pelvis in the air (simulation)."""
+def motor_torque(env, sim):
+    """Each joint's torque, N m, in the env's joint order: what the motor reports on the robot (tau_est), what is applied in simulation.
+    NaN if it cannot be read: this runs in the loop, where an exception would be a guard stop."""
+    n = len(env.joint_names)
+    try:
+        tau = env.data.actuator_force if sim else env.robot_state.motor_state.tau_est
+        idx = getattr(env, "_dof_idx", None)
+        tau = np.array(tau if idx is None else [tau[i] for i in idx], float)
+        return tau if tau.shape == (n,) else np.full(n, np.nan)
+    except Exception:  # noqa: BLE001
+        return np.full(n, np.nan)
 
-    def __init__(self, env, sim, triggers, pin=None, clock=time.perf_counter, sleep=time.sleep):
-        self.env, self.sim, self.triggers, self.pin = env, sim, triggers, pin
+
+class SimHang:
+    """Simulation: the robot hangs from `body` as from the gantry, gravity loading everything below it. Putting a free root back after every
+    step does not do this: between the resets the whole robot is in free fall and the joints feel no gravity (the reference of 2026-11-03:
+    no sag at all, more of each step reached than a loaded joint can). Here the body gets a huge mass, and a force and torque on it carry
+    the whole robot's weight, so nothing moves it but the joints' reactions, which that mass does not feel."""
+
+    MASS_FACTOR = 1e4
+
+    def __init__(self, env, body):
+        import mujoco
+
+        self.m, self.d = env.model, env.data
+        self.b = mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_BODY, body)
+        if self.b < 0:
+            sys.exit(f"--hang-body {body}: no such body in the model")
+        self.root = int(self.m.jnt_bodyid[0])
+        self.m.body_mass[self.b] *= self.MASS_FACTOR
+        self.m.body_inertia[self.b] *= self.MASS_FACTOR
+        mujoco.mj_setConst(self.m, self.d)  # (it leaves the model's pose in data: reset the robot after this)
+        self.weight = np.array([0.0, 0.0, -float(self.m.opt.gravity[2]) * float(self.m.body_subtreemass[self.root])])
+
+    def tick(self):
+        """The force and torque for the next step, at the body's centre of mass (data must be current: after a reset or a step)."""
+        self.d.xfrc_applied[self.b, :3] = self.weight
+        self.d.xfrc_applied[self.b, 3:] = np.cross(self.d.subtree_com[self.root] - self.d.xipos[self.b], self.weight)
+
+
+class Runner:
+    """Drives the env at LOOP_DT with a target vector, watching the stops (the robot) and keeping the robot hanging (simulation)."""
+
+    def __init__(self, env, sim, triggers, hang=None, clock=time.perf_counter, sleep=time.sleep):
+        self.env, self.sim, self.triggers, self.hang = env, sim, triggers, hang
         self.clock, self.sleep, self.held, self.n = clock, sleep, 0, 0
 
     def now(self):
         return float(self.env.data.time) if self.sim else self.clock()
 
     def tick(self, target):
-        """One loop: read the state, check the stops, send the target. Returns (time of the reading, joint angles)."""
+        """One loop: read the state, check the stops, send the target. Returns (time of the reading, joint angles, joint torques)."""
         self.env.update()
-        t, q = self.now(), np.array(self.env.dof_pos, float)
+        t, q, tau = self.now(), np.array(self.env.dof_pos, float), motor_torque(self.env, self.sim)
         if not self.sim:
             b = rp.remote_stop_buttons(self.env, self.triggers)
             self.held = self.held + 1 if b else 0
             if self.held >= STOP_HELD:
                 raise rp.StopRequested(f"operator stop {b}")
         self.env.step(np.asarray(target, np.float32))
-        if self.pin is not None:
-            self.env.data.qpos[:7] = self.pin
-            self.env.data.qvel[:6] = 0.0
+        if self.hang is not None:
+            self.hang.tick()
         self.n += 1
-        return t, q
+        return t, q, tau
 
     def run(self, duration, target_fn):
-        """target_fn(k) -> the target vector at loop k (it should change only every CMD_EVERY loops). Returns t, q, targets."""
-        T, Q, C = [], [], []
+        """target_fn(k) -> the target vector at loop k (it should change only every CMD_EVERY loops). Returns t, q, targets, torques."""
+        T, Q, C, U = [], [], [], []
         t_next = self.clock()
         for k in range(int(round(duration / LOOP_DT))):
             c = target_fn(k)
-            t, q = self.tick(c)
-            T.append(t), Q.append(q), C.append(np.array(c, float))
+            t, q, tau = self.tick(c)
+            T.append(t), Q.append(q), C.append(np.array(c, float)), U.append(tau)
             if not self.sim:
                 t_next += LOOP_DT
                 slack = t_next - self.clock()
@@ -193,11 +247,11 @@ class Runner:
                     self.sleep(slack)
                 else:
                     t_next = self.clock()
-        return np.array(T), np.array(Q), np.array(C)
+        return np.array(T), np.array(Q), np.array(C), np.array(U)
 
 
-def test_joint(runner, ready, j, amp, lim):
-    """One joint's steps and sweep from the ready pose. Returns the record (series of that joint, results)."""
+def test_joint(runner, ready, j, amp, lim, kp=0.0):
+    """One joint's steps and sweep from the ready pose (kp: its gain). Returns the record (series of that joint, results)."""
     pieces, segs, dur, sides = plan_joint(ready[j], lim, amp)
     held = [ready[j]]
 
@@ -208,21 +262,24 @@ def test_joint(runner, ready, j, amp, lim):
         c[j] = held[0]
         return c
 
-    T, Q, C = runner.run(dur, target)
+    T, Q, C, U = runner.run(dur, target)
     t = T - T[0]
-    res = analyse(t, C[:, j], Q[:, j], segs)
+    res = analyse(t, C[:, j], Q[:, j], segs, U[:, j], kp)
     others = np.delete(np.abs(Q - ready), j, axis=1).max()
-    return dict(t=np.round(t, 5).tolist(), cmd=np.round(C[:, j], 5).tolist(), q=np.round(Q[:, j], 5).tolist(), sides=sides,
-                others_max_dev=float(others), **res)
+    rest = t < SETTLE
+    return dict(t=np.round(t, 5).tolist(), cmd=np.round(C[:, j], 5).tolist(), q=np.round(Q[:, j], 5).tolist(), tau=np.round(U[:, j], 3).tolist(),
+                sides=sides, others_max_dev=float(others), rest_kp_err=float(kp * np.median(C[rest, j] - Q[rest, j])),
+                rest_tau=float(np.median(U[rest, j])), **res)
 
 
 def print_row(name, r, ref=None):
     x = lambda v, f: f.format(v) if np.isfinite(v) else "   -"  # noqa: E731
-    line = (f"  {name:28s} {x(r['dead_ms'], '{:5.0f}')} {x(r['t63_ms'], '{:5.0f}')} {x(r['overshoot'] * 100, '{:5.0f}')}% "
-            f"{x(r['reached'], '{:6.2f}')} {x(r['sine_delay_ms'], '{:6.0f}')} {x(r['sine_gain'], '{:6.2f}')}")
+    line = (f"  {name:28s} {x(r['move_ms'], '{:5.0f}')} {x(r['dead_ms'], '{:5.0f}')} {x(r['t63_ms'], '{:5.0f}')} "
+            f"{x(r['overshoot'] * 100, '{:5.0f}')}% {x(r['reached'], '{:6.2f}')} {x(r['sine_delay_ms'], '{:6.0f}')} {x(r['sine_gain'], '{:6.2f}')} "
+            f"{x(r['rest_kp_err'], '{:+7.1f}')} {x(r['rest_tau'], '{:+7.1f}')}")
     if ref is not None:
-        line += (f"   | vs sim: dead {x(r['dead_ms'] - ref['dead_ms'], '{:+5.0f}')} t63 {x(r['t63_ms'] - ref['t63_ms'], '{:+5.0f}')} "
-                 f"sine delay {x(r['sine_delay_ms'] - ref['sine_delay_ms'], '{:+5.0f}')} ms")
+        line += (f"   | vs sim: first motion {x(r['move_ms'] - ref.get('move_ms', np.nan), '{:+5.0f}')} ms, "
+                 f"reached {x(r['reached'] - ref['reached'], '{:+5.2f}')}")
     print(line, flush=True)
 
 
@@ -232,13 +289,21 @@ def main():
     ap.add_argument("--joints", nargs="+", default=["arms"], help="groups (arms legs waist all) and/or joint names")
     ap.add_argument("--amp", type=float, default=0.10, help=f"step size, rad (at most {AMP_MAX})")
     ap.add_argument("--ramp-seconds", type=float, default=3.0, help="the ramp from the hanging pose to the ready pose")
-    ap.add_argument("--hang-height", type=float, default=0.15, help="sim: the pelvis held this far above its standing height")
+    ap.add_argument("--hang-height", type=float, default=0.15, help="sim: the pelvis starts this far above its standing height")
+    ap.add_argument("--hang-body", default="torso_link", help="sim: the body held in the air, where the gantry takes the robot's weight")
     ap.add_argument("--dry-run", action="store_true", help="print the plan and the robot state's fields; no torque")
     ap.add_argument("--log", type=str, nargs="?", const="", default=None, help="the record: logs/pingpong/ (robot) or logs/pingpong-sim/")
     ap.add_argument("--compare", type=str, default=None, help="a simulation log of this script: print the robot's extra delay per joint")
     a = ap.parse_args()
     if not 0.0 < a.amp <= AMP_MAX:
         sys.exit(f"--amp must be in (0, {AMP_MAX}] rad")
+    ref = {}
+    if a.compare:  # read now: a file that is not there must not become a guard stop in the middle of the test
+        try:
+            with open(a.compare) as f:
+                ref = json.load(f)["joints"]
+        except (OSError, ValueError, KeyError) as e:
+            sys.exit(f"--compare {a.compare}: {e!r}")
 
     cfg = ConfigManager(config_name=a.config).get_cfg()
     sim = bool(cfg.env.is_sim)
@@ -288,12 +353,13 @@ def main():
         env.shutdown()
         sys.exit("no stop button on the remote (UnitreeCtrl triggers): refusing to apply torque")
 
-    pin = None
+    hang = None
     if sim:
+        hang = SimHang(env, a.hang_body)
         env.reset_to_ready(float(lib.ready_root_z[0]) + 0.016 + a.hang_height, lib.ready_root_quat[0], ready)
-        pin = env.data.qpos[:7].copy()
-    runner = Runner(env, sim, triggers, pin=pin)
-    results, stop = {}, None
+        hang.tick()
+    runner = Runner(env, sim, triggers, hang=hang)
+    results, rest, stop = {}, {}, None
     t_start = time.strftime("%Y-%m-%d %H:%M:%S")
     try:
         env.update()
@@ -301,13 +367,19 @@ def main():
         n_ramp = max(int(round(a.ramp_seconds / LOOP_DT)), 1)
         print(f"ramp to the ready pose ({a.ramp_seconds:.0f} s) ...", flush=True)
         runner.run(a.ramp_seconds, lambda k: q_start + (ready - q_start) * min((k // CMD_EVERY * CMD_EVERY) / n_ramp, 1.0))
-        runner.run(1.0, lambda k: ready)
-        print(f"\n  {'joint':28s} {'dead':>5} {'t63':>5} {'over':>6} {'reach':>6} {'sine':>6} {'gain':>6}   (ms, ms, %, share, ms, ratio)")
-        ref = json.load(open(a.compare))["joints"] if a.compare else {}
+        T, Q, _, U = runner.run(1.0, lambda k: ready)
+        late = T >= T[0] + 0.5
+        for i, n in enumerate(env.joint_names):
+            q_rest = float(np.median(Q[late, i]))
+            rest[n] = dict(target=float(ready[i]), q=q_rest, kp_err=float(env.stiffness[i]) * (float(ready[i]) - q_rest), tau=float(np.median(U[late, i])))
+        top = sorted(rest, key=lambda n: -abs(rest[n]["kp_err"]))[:6]
+        print("at rest, the largest kp x error (the motor's torque), N m: " + ", ".join(f"{n} {rest[n]['kp_err']:+.1f} ({rest[n]['tau']:+.1f})" for n in top))
+        print(f"\n  {'joint':28s} {'move':>5} {'dead':>5} {'t63':>5} {'over':>6} {'reach':>6} {'sine':>6} {'gain':>6} {'kp*err':>7} {'tau':>7}"
+              "   (ms, ms, ms, %, share, ms, ratio; at rest, N m)")
         for n in joints:
             j = env.joint_names.index(n)
             t0 = state_fields(env) if not sim else {}
-            r = test_joint(runner, ready, j, a.amp, limits[j])
+            r = test_joint(runner, ready, j, a.amp, limits[j], float(env.stiffness[j]))
             if not sim:
                 r["state_before"], r["state_after"] = {k: v for k, v in t0.items() if k.startswith(("motor_t", "bms", "battery"))}, \
                     {k: v for k, v in state_fields(env).items() if k.startswith(("motor_t", "bms", "battery"))}
@@ -315,10 +387,9 @@ def main():
             print_row(n, r, ref.get(n))
         if ref:
             common = [n for n in results if n in ref]
-            d = [results[n]["dead_ms"] - ref[n]["dead_ms"] for n in common]
-            s = [results[n]["sine_delay_ms"] - ref[n]["sine_delay_ms"] for n in common]
-            print(f"\n  extra delay vs the simulation, median over {len(common)} joints: dead time {np.nanmedian(d):+.0f} ms, "
-                  f"sine delay {np.nanmedian(s):+.0f} ms (training covered 0-20 ms)")
+            d = [results[n]["move_ms"] - ref[n].get("move_ms", np.nan) for n in common]
+            print(f"\n  extra delay vs the simulation, first motion, median over {len(common)} joints: {np.nanmedian(d):+.0f} ms "
+                  "(training covered 0-20 ms)")
         if not sim:
             print("\ndone: holding the ready pose. Ctrl-C to release the motors (the gantry holds the robot).", flush=True)
             while True:
@@ -336,8 +407,8 @@ def main():
     finally:
         if log:
             meta = dict(config=a.config, sim=sim, date=t_start, joints_asked=joints, amp=a.amp, loop_dt=LOOP_DT, cmd_every=CMD_EVERY,
-                        freqs=list(FREQS), hang_height=a.hang_height if sim else None, stop=stop,
-                        stiffness={n: float(env.stiffness[env.joint_names.index(n)]) for n in joints}, state_fields=fields)
+                        freqs=list(FREQS), hang_height=a.hang_height if sim else None, hang_body=a.hang_body if sim else None, stop=stop,
+                        stiffness={n: float(env.stiffness[env.joint_names.index(n)]) for n in joints}, state_fields=fields, rest=rest)
             with open(log, "w") as f:
                 json.dump(dict(meta=meta, joints=results), f)
             print(f"-> {log}")

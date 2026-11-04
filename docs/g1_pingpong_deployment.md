@@ -91,8 +91,14 @@ python scripts/deploy/natnet_relay.py    # defaults: Motive 192.168.123.200, thi
 ```
 Motive > Streaming: Unicast; Rigid Bodies, Labeled Markers, Unlabeled Markers on. Motive's default y-up axes are turned to z-up by the
 relay (`--up y`, the default; `--up z` if Motive streams z-up). Its status line every 2 s: Motive's frame rate, latency (from Motive's
-camera timestamps), pelvis tracked, `table markers 8.0/frame`, unlabeled markers per frame. Tested only against a fake Motive
+camera timestamps), `clock +0.0%`, pelvis tracked, `table markers 8.0/frame`, unlabeled markers per frame. Tested only against a fake Motive
 (`tests/deploy/test_natnet_relay.py`), not a real one.
+
+**Check `clock` before playing.** It is this computer's clock against Motive's frame times, measured every 5 s. Above 1 % the relay prints a
+`WARNING` every 10 s, and it says which side is wrong (`clock OK again` when it clears); do not play while it shows. Perception and the
+player take every time from this clock, so nothing else shows the fault: on 2026-11-04 the clock ran 8.3 % fast after the G1 PC restarted, for
+at least the first 20 min: Motive at 240 Hz read 221 frames/s, balls fell at 8.2 m/s^2 in the log and the 50 Hz loop was about 54 Hz. Look with
+`chronyc tracking`; `sudo chronyc makestep` should end it at once (not yet tried on the robot).
 
 **B4. Perception.** The robot standing at home:
 ```bash
@@ -173,19 +179,34 @@ kept in the log (`meta.pelvis_check`; `analyze_shots.py` prints it from the new 
 
 **B7-delay. The motor delay, joint by joint** (`scripts/measure_motor_delay.py`, 2026-11-03). The robot HANGS from the gantry, feet at
 least 5 cm off the floor; the gains are the policy's. One joint at a time (all others hold the ready pose): steps of 0.10 rad and a sine
-of 0.05 rad at 1-5 Hz, sent at 200 Hz but changing at 50 Hz like the policy's targets; the angle recorded at 200 Hz. Stops as the
-player's (remote A / Select / Start, Ctrl-C -> the guard stop); at the end it holds the ready pose until Ctrl-C.
+of 0.05 rad at 1-5 Hz, sent at 200 Hz but changing at 50 Hz like the policy's targets; the angle and the motor's torque (`tau_est`)
+recorded at 200 Hz. Stops as the player's (remote A / Select / Start, Ctrl-C -> the guard stop); at the end it holds the ready pose until
+Ctrl-C.
 ```bash
 python scripts/measure_motor_delay.py -c g1_pingpong_real --dry-run                     # the plan and the robot state's fields, no torque
 python scripts/measure_motor_delay.py -c g1_pingpong_real --joints arms --log \
     --compare logs/pingpong-sim/motor_delay_sim_reference.json                         # ~1.5 min; then: --joints legs waist
+python scripts/measure_motor_delay.py -c g1_pingpong_real --joints ankles --log          # ankle pitch and roll alone, ~1 min
 ```
-Per joint: dead time (command to 10 % of the step), t63, overshoot, share of the step reached, the sine's delay and gain; with
-`--compare` the difference to the simulation (the robot's EXTRA delay: training covered 0-20 ms). The simulation reference is
-`-c g1_pingpong --joints all --log` (logs/pingpong-sim/). Read: one joint much slower than its mirror = that motor; all joints alike =
-the system's latency; growing over a session = heat (repeat at the end of a session, and once on a full battery). Tested: a stand-in
-robot with a known delay (20 ms recovered within 0-3 ms; the remote's stop held 40 ms stops, a one-packet blip does not; the guard stop
-runs), and MuJoCo with 20 ms added to every motor (measured +20 ms on all 15 joints). Not yet run on the robot.
+`--compare` needs the reference file on the robot; without it the log can be compared afterwards. Per joint: first motion
+(command to 2 mrad of motion), dead time (command to 10 % of the step), t63, overshoot, share of the step reached, the sine's delay and gain,
+and at rest kp x error against the motor's torque; with `--compare` the difference to the simulation (the robot's EXTRA delay: training
+covered 0-20 ms). The log's `meta.rest` has every joint's target, angle and torque before the test. The simulation reference is
+`-c g1_pingpong --joints all --log motor_delay_sim_reference.json` (logs/pingpong-sim/): the torso held in the air (`--hang-body`), gravity
+loading what hangs from it. The earlier reference was weightless (the whole robot in free fall between resets), kept as `*_weightless.json`.
+
+Read the delay from first motion, as the median over joints: friction holds a joint back on small steps, which stretches dead time and t63
+and bends the sine's delay. One joint much slower than its mirror = that motor; all joints alike = the system's latency. Read the torque
+of a joint that does not move: the motor's torque near kp x error = the motor pushes and something holds the joint (friction, contact);
+near 0 = the motor is not pushing. The share reached against the simulation's gives the joint's sticking torque: kp x step x the
+difference (it cannot read more than kp x step: 2.9 N m on the ankles). The robot state has no motor temperatures or battery voltage.
+
+Robot, 2026-11-04 (hanging, feet clear): extra delay +3 ms (median, 15 joints): within training. Sticking torque against the simulation's
+0.1 N m: shoulders 0-0.25, elbows 0.5-0.6, waist 0.7, hip pitch 2.5-3.2, knees 2.9-5.6 N m. The ankles did not move: 6.8 / 5.0 N m at rest
+and up to 9.5 N m on the steps moved them 0.004-0.007 rad, though in play they move 0.3-0.4 rad per swing. Tested: a stand-in robot with a
+known delay (20 ms recovered within 0-3 ms; a stuck joint with and without the motor pushing; the remote's stop held 40 ms stops, a one-packet
+blip does not; the guard stop runs), and MuJoCo with 20 ms added to every motor (first motion +20 ms as the median, 13 of 17 joints within
+3 ms; the shoulders read 10-18 ms low: they are still settling from the last step). The torque columns have not run on the robot yet.
 
 **B7a. Pelvis pivot (do it at the first floor stand).** Motive's pivot of the pelvis rigid body is where Motive put it (the markers'
 centre unless moved), not the pelvis origin the policy was trained with; every target the policy sees is measured from the pelvis, so
