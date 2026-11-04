@@ -30,7 +30,8 @@ Pelvis height check (pingpong/deploy/pelvis_height.py). While the robot stands o
 origin's true height above the floor; perception's pelvis z should match it. Every 5 s and at the end the player logs both and what is
 left over, which is Motive's pivot of the pelvis rigid body sitting off the pelvis origin: give it to perception as
 `run_perception.py ... --pelvis-pivot 0 0 <Z>` (added to the value set now, if any). Valid only with the robot's weight on its feet:
-hanging in the gantry with level feet looks the same to the legs.
+hanging in the gantry with level feet looks the same to the legs. Beside it, the pelvis axes: Motive's pitch and roll against the IMU
+(the recorded paddle face carries that offset, the policy does not).
 
 Simulation viewer (--window): the ball orange, the racket target blue (during a swing), the station green, home grey.
 """

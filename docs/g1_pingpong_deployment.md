@@ -160,6 +160,17 @@ guard pose.
 
 **B7. On the floor** (rope slack, attached): stand 1-2 min; measure the motor delay (command to motion; fix6-7 trained with 0-20 ms).
 
+**B7b. Pelvis axes (pitch and roll).** The heading calibration turns the pelvis rigid body only about the vertical, so a rigid body mounted a
+few degrees off stays that far off in pitch and roll. Beside the height line the player logs, every 5 s and at the end,
+```
+[player] pelvis axes (feet flat, ...): Motive minus IMU pitch -3.3, roll +2.5 deg (...; on the IMU the soles are level to 0.6 deg) -> the pelvis
+rigid body is 4.1 deg off: the policy is not affected (its gravity is the IMU's), but the logged paddle face is, by 3.6 cm at 0.5 m reach
+```
+kept in the log (`meta.pelvis_check`; `analyze_shots.py` prints it from the new `g_imu_*`, `g_mocap_*` step fields). In simulation a mount error of
+-3.3 / +2.5 deg was reported as -3.2 / +2.5; returns stayed within run-to-run noise (92.2 -> 89.8 %, 128 balls) while the LOG's balls within 8 cm fell
+103 -> 74: read racket numbers with this line in mind. The 2026-11-03 session had about -3.3 / +1.8..+3.2 deg (from the legs): corrected for it and the
+2 cm pivot, the wide forehand's -91 mm was -32 mm.
+
 **B7-delay. The motor delay, joint by joint** (`scripts/measure_motor_delay.py`, 2026-11-03). The robot HANGS from the gantry, feet at
 least 5 cm off the floor; the gains are the policy's. One joint at a time (all others hold the ready pose): steps of 0.10 rad and a sine
 of 0.05 rad at 1-5 Hz, sent at 200 Hz but changing at 50 Hz like the policy's targets; the angle recorded at 200 Hz. Stops as the

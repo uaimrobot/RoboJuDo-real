@@ -129,6 +129,9 @@ profile_output*
 *.wbproj
 # assets/motions
 .gr1t2.jpg
-logs
+logs/locomotion_frames
+logs/locomotion_frames_fixed
+logs/robojudo.log
+
 MUJOCO_LOG.TXT
 # assets/resources
