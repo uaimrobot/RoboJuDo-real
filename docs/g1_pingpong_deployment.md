@@ -167,7 +167,7 @@ few degrees off stays that far off in pitch and roll. Beside the height line the
 rigid body is 4.1 deg off: the policy is not affected (its gravity is the IMU's), but the logged paddle face is, by 3.6 cm at 0.5 m reach
 ```
 kept in the log (`meta.pelvis_check`; `analyze_shots.py` prints it from the new `g_imu_*`, `g_mocap_*` step fields). In simulation a mount error of
--3.3 / +2.5 deg was reported as -3.2 / +2.5; returns stayed within run-to-run noise (92.2 -> 89.8 %, 128 balls) while the LOG's balls within 8 cm fell
+-3.3 / +2.5 deg was reported as -3.2 / +2.5; returns stayed within run-to-run noise (88-92 % without it, 90-93 % with it, 128 balls) while the LOG's balls within 8 cm fell
 103 -> 74: read racket numbers with this line in mind. The 2026-11-03 session had about -3.3 / +1.8..+3.2 deg (from the legs): corrected for it and the
 2 cm pivot, the wide forehand's -91 mm was -32 mm.
 
