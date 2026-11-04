@@ -53,6 +53,9 @@ set a limit. A progress line every 10 balls; the summary at the end.
 
 **A3. Variations** (player flags): `--sensing camera` (100 Hz, 5 mm, 30 ms; give perception `--noise 0.005`), `--start-offset 0.2 0.1 10`
 (start off home), `--balls topspin`, `--env-idx 5` (another ball sequence), `--opti-frame fixed`.
+`--avoid-late [TYPE ...]` (planner: a footwork step or another stroke type that starts on time before a late swing; default types
+forehand backhand). Opt-in, OFF by default: on fix6-7 @16500 (2026-11-03, 128 paired balls, lab sensing) it halved late plans (32 -> 17 %)
+but returned 90.6 vs 94.5 % nominal and 67.2 vs 68.8 % with 20 ms motor delay + 300 g paddle - no gain.
 
 **A4. Fast batch runs** (one process, perception inside, planner inline): `python scripts/run_pingpong.py -c g1_pingpong_inproc --n-shots 64
 --compute-scale 0`. Same play; use it for statistics.
@@ -157,6 +160,22 @@ guard pose.
 
 **B7. On the floor** (rope slack, attached): stand 1-2 min; measure the motor delay (command to motion; fix6-7 trained with 0-20 ms).
 
+**B7-delay. The motor delay, joint by joint** (`scripts/measure_motor_delay.py`, 2026-11-03). The robot HANGS from the gantry, feet at
+least 5 cm off the floor; the gains are the policy's. One joint at a time (all others hold the ready pose): steps of 0.10 rad and a sine
+of 0.05 rad at 1-5 Hz, sent at 200 Hz but changing at 50 Hz like the policy's targets; the angle recorded at 200 Hz. Stops as the
+player's (remote A / Select / Start, Ctrl-C -> the guard stop); at the end it holds the ready pose until Ctrl-C.
+```bash
+python scripts/measure_motor_delay.py -c g1_pingpong_real --dry-run                     # the plan and the robot state's fields, no torque
+python scripts/measure_motor_delay.py -c g1_pingpong_real --joints arms --log \
+    --compare logs/pingpong-sim/motor_delay_sim_reference.json                         # ~1.5 min; then: --joints legs waist
+```
+Per joint: dead time (command to 10 % of the step), t63, overshoot, share of the step reached, the sine's delay and gain; with
+`--compare` the difference to the simulation (the robot's EXTRA delay: training covered 0-20 ms). The simulation reference is
+`-c g1_pingpong --joints all --log` (logs/pingpong-sim/). Read: one joint much slower than its mirror = that motor; all joints alike =
+the system's latency; growing over a session = heat (repeat at the end of a session, and once on a full battery). Tested: a stand-in
+robot with a known delay (20 ms recovered within 0-3 ms; the remote's stop held 40 ms stops, a one-packet blip does not; the guard stop
+runs), and MuJoCo with 20 ms added to every motor (measured +20 ms on all 15 joints). Not yet run on the robot.
+
 **B7a. Pelvis pivot (do it at the first floor stand).** Motive's pivot of the pelvis rigid body is where Motive put it (the markers'
 centre unless moved), not the pelvis origin the policy was trained with; every target the policy sees is measured from the pelvis, so
 an offset shifts them all. In simulation a pivot 10 cm low cut the returns from 100 % to 42 % (64 balls; corrected: 98 %). The player
@@ -173,7 +192,7 @@ body is edited in Motive. Only the vertical part is measured; x / y stay Motive'
 
 **B8. Balls:** slow, well-placed serves from a launcher first; fit the ball and rubber models (`ball.yaml`) to real flights before judging.
 
-**B9. Recording a session (where do the misses come from?).** Run the player with `--log` (logs go inside this workspace, in `logs/pingpong/` (git-ignored): `--log` alone names the file `<shots|shadow|manual>_<date>_<time>.json`, `--log name.json` or a relative path puts it there too; `--script-plans name.json` also finds a shot log there by name): the runtime's shot recorder
+**B9. Recording a session (where do the misses come from?).** Run the player with `--log` (logs go inside this workspace, git-ignored: `logs/pingpong/` for the robot, **`logs/pingpong-sim/` for every simulation player**: `--log` alone names the file `<shots|shadow|manual>_<date>_<time>.json`, `--log name.json` or a relative path puts it there too; `--script-plans name.json` also finds a shot log there by name): the runtime's shot recorder
 keeps, per ball, the samples perception sent, every plan applied (the predicted ball at the strike, the racket target) and, every
 control step, the paddle face from the joint angles. Then, on any computer with the pingpong folder:
 ```bash
@@ -241,7 +260,7 @@ are far off, the re-plans fix them). 10 balls were lost at or before the bounce,
 against the same targets:
 ```bash
 python scripts/run_pingpong.py -c g1_pingpong_real --script-plans shots_1751.json --log      # robot (the shot log by name from logs/pingpong/)
-python scripts/run_pingpong.py -c g1_pingpong_inproc --script-plans shots_1751.json --log    # sim reference
+python scripts/run_pingpong.py -c g1_pingpong_inproc --script-plans shots_1751.json --log    # sim reference -> logs/pingpong-sim/shadow_*.json (finds the robot's shots_1751.json in logs/pingpong/)
 python scripts/deploy/analyze_shots.py <RoboJuDo>/logs/pingpong/shadow_<date>_<time>.json        # pingpong folder: its racket rows
 ```
 The first scripted swing starts 3 s after the policy runs, each next one 1 s after the last swing is over (37 shots ~1.5 min); the
@@ -254,7 +273,7 @@ perception's pelvis pose and the ball. A paddle rigid body in Motive (3-4 marker
 (`pingpong/deploy/manual_plans.py`; balls ignored, perception runs for the pelvis):
 ```bash
 python scripts/run_pingpong.py -c g1_pingpong_real --manual --log    # terminal 1 -> logs/pingpong/manual_<date>_<time>.json
-# simulation: -c g1_pingpong_inproc --manual --window --log   (--window opens the MuJoCo viewer; --manual paces it to real time)
+# simulation: -c g1_pingpong_inproc --manual --window --log   (--window opens the MuJoCo viewer; --manual paces it to real time; log in logs/pingpong-sim/)
 python scripts/deploy/planner_console.py                                                          # terminal 2, pingpong folder
 ```
 A bare swing name (`fh_t100`, `bh_t125`, `bh_flick_t100`, ...; `list` shows them) is that swing's DEFAULT target: the typical row
@@ -278,7 +297,7 @@ Every stop on the robot is RoboJuDo's guard stop: **legs and waist go limp at on
 robot falls unless the gantry or rope holds it** (in MuJoCo the pelvis drops from 0.79 to 0.39 m in 1.5 s). The control loop carries
 the guard out, so after a stop the player keeps running and holds it **until Ctrl-C**; then it ends and the motors are released.
 With `--log`, the record is written the moment the stop begins (on a thread, the stepping goes on) and again, whole, when the program
-ends: a player that is killed instead of ended with that second Ctrl-C still leaves its log in `logs/pingpong/`.
+ends: a player that is killed instead of ended with that second Ctrl-C still leaves its log in `logs/pingpong/` (`logs/pingpong-sim/` in simulation).
 
 | what stops | when |
 |---|---|

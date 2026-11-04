@@ -70,10 +70,11 @@ class PelvisHeightCheck:
     EVERY = 5  # control steps between samples (the FK is pure python, ~0.2 ms)
 
     def __init__(self, env):
-        from pingpong.deploy.pelvis_height import LegFK
+        from pingpong.deploy.pelvis_height import LegFK, axes_offset
 
-        self.env, self.fk, self.n = env, LegFK(), 0
+        self.env, self.fk, self.n, self.axes_offset = env, LegFK(), 0, axes_offset
         self.rows = []  # (legs, perception, cos tilt, truth or nan)
+        self.axes = []  # (pitch, roll: mocap's pelvis axes minus the IMU's, deg; the soles' tilt on the IMU, deg)
         self.n_not_flat = 0
 
     def step(self, info, sim):
@@ -98,6 +99,35 @@ class PelvisHeightCheck:
         x, y = q[0], q[1]
         cz = 1.0 - 2.0 * (x * x + y * y)  # the pelvis z axis's vertical component
         self.rows.append((h, float(info["pelvis"][2]), cz, float(self.env.data.qpos[2]) if sim else np.nan))
+        if "pelvis_R" in info:
+            from robojudo.utils.util_func import get_gravity_orientation
+
+            soles = self.fk.feet(self.env.joint_names, self.env.dof_pos, q)
+            self.axes.append((*self.axes_offset(info["pelvis_R"], get_gravity_orientation(q)), max(v[1] for v in soles.values())))
+
+    def axes_summary(self, last=None):
+        """Mocap's pelvis pitch and roll against the IMU, the IMU itself checked by the level soles."""
+        r = np.array(self.axes[-last:] if last else self.axes)
+        if not len(r):
+            return "pelvis axes: no step with both feet flat yet"
+        p, ro, sole = np.median(r, axis=0)
+        msg = (f"pelvis axes (feet flat, {len(r)} samples): Motive minus IMU pitch {p:+.1f}, roll {ro:+.1f} deg "
+               f"(nose down +, left side up +; on the IMU the soles are level to {sole:.1f} deg)")
+        off = float(np.hypot(p, ro))
+        if off < 1.0:
+            return msg + " -> agree (within 1 deg)"
+        return msg + (f" -> the pelvis rigid body is {off:.1f} deg off: the policy is not affected (its gravity is the IMU's), but the logged "
+                      f"paddle face is, by {np.radians(off) * 50:.1f} cm at 0.5 m reach. Valid only standing on the feet")
+
+    def report(self):
+        """For the log: the medians of the height and axes checks."""
+        out = {}
+        if self.rows:
+            r = np.array(self.rows)
+            out.update(legs_m=float(np.median(r[:, 0])), perception_m=float(np.median(r[:, 1])), height_samples=len(r))
+        if self.axes:
+            out.update(zip(("axes_pitch_deg", "axes_roll_deg", "sole_tilt_deg"), np.median(np.array(self.axes), axis=0).tolist()))
+        return out
 
     def summary(self, last=None):
         r = np.array(self.rows[-last:] if last else self.rows)
@@ -257,23 +287,38 @@ def hold_guard(pipeline, env, dt, reason, on_hold=None):
         logger.warning("ended after the stop")
 
 
-LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "pingpong")  # (logs/ is git-ignored)
+LOG_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")  # (logs/ is git-ignored)
 
 
-def log_path(name, kind):
-    """--log's file: a name or relative path inside LOG_DIR (created); "" = <kind>_<date>_<time>.json there. An absolute path is kept
+def log_dir(sim):
+    """The robot's logs and the simulation's are kept apart."""
+    return os.path.join(LOG_ROOT, "pingpong-sim" if sim else "pingpong")
+
+
+def log_path(name, kind, sim):
+    """--log's file: a name or relative path inside log_dir(sim) (created); "" = <kind>_<date>_<time>.json there. An absolute path is kept
     (with a warning when it is outside this workspace)."""
     if not name:
         name = f"{kind}_{time.strftime('%Y%m%d_%H%M%S')}.json"
     if os.path.isabs(name):
-        ws = os.path.dirname(os.path.dirname(LOG_DIR))
-        if not os.path.abspath(name).startswith(ws + os.sep):
-            logger.warning(f"--log {name} is outside the RoboJuDo workspace (logs go to {LOG_DIR} with a name or relative path)")
+        if not os.path.abspath(name).startswith(os.path.dirname(LOG_ROOT) + os.sep):
+            logger.warning(f"--log {name} is outside the RoboJuDo workspace (logs go to {log_dir(sim)} with a name or relative path)")
         path = name
     else:
-        path = os.path.join(LOG_DIR, name)
+        path = os.path.join(log_dir(sim), name)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     return path
+
+
+def find_plans(name, sim):
+    """--script-plans NAME: a path, or a shot log by its name in this mode's log folder, then in the other's (the robot's logs are
+    replayed in simulation)."""
+    if os.path.isabs(name) or os.path.exists(name):
+        return name
+    for d in (log_dir(sim), log_dir(not sim)):
+        if os.path.exists(os.path.join(d, name)):
+            return os.path.join(d, name)
+    return os.path.join(log_dir(sim), name)
 
 
 def _json_default(o):
@@ -342,8 +387,8 @@ def main():
     ap.add_argument("--realtime", action="store_true", help="sim: pace to real time (default: as fast as possible)")
     ap.add_argument("--log", type=str, nargs="?", const="", default=None, help="write the run's record: .json = every shot's ball "
                     "samples, plans and paddle face per step (the shot recorder; pingpong scripts/deploy/analyze_shots.py reads it); "
-                    ".npz = per-step timing. A name or relative path goes into this workspace's logs/pingpong/; --log alone: "
-                    "logs/pingpong/<shots|shadow|manual>_<date>_<time>.json")
+                    ".npz = per-step timing. A name or relative path goes into this workspace's logs/pingpong/ (the robot) or logs/pingpong-sim/ (simulation); "
+                    "--log alone: <shots|shadow|manual>_<date>_<time>.json there")
     ap.add_argument("--wait-perception", type=float, default=300.0, help="s to wait for the perception program before giving up")
     ap.add_argument("--perception-port", type=int, default=None, help="UDP port perception's messages come to (7780)")
     ap.add_argument("--raw-to", type=str, default=None, help="sim: host:port the simulated cameras send raw frames to (127.0.0.1:7770)")
@@ -373,22 +418,25 @@ def main():
     ap.add_argument("--manual-host", type=str, default=None, help="the interface --manual listens on (default 127.0.0.1; 0.0.0.0 for "
                     "a console on another computer)")
     ap.add_argument("--compute-scale", type=float, default=None, help="x the measured planner time (0 = instant)")
+    ap.add_argument("--avoid-late", nargs="*", default=None, metavar="TYPE",
+                    help="planner: a footwork step or another stroke type that starts on time before a late swing; the stroke types "
+                    "given (default: forehand backhand) first for the balls that are late anyway")
     ap.add_argument("--checkpoint", type=str, default=None)
     ap.add_argument("--actor-path", type=str, default=None)
     ap.add_argument("--start-offset", type=float, nargs=3, default=[0.0, 0.0, 0.0], metavar=("FWD", "LEFT", "YAW_DEG"), help="sim: start off home")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    if a.log is not None:
-        a.log = log_path(a.log, "manual" if a.manual is not None else "shadow" if a.script_plans else "shots")
-    if a.script_plans and not os.path.isabs(a.script_plans) and not os.path.exists(a.script_plans):
-        a.script_plans = os.path.join(LOG_DIR, a.script_plans)  # a shot log by its name in logs/pingpong/
-
     cfg = ConfigManager(config_name=a.config).get_cfg()
+    sim = bool(cfg.env.is_sim)
+    if a.log is not None:
+        a.log = log_path(a.log, "manual" if a.manual is not None else "shadow" if a.script_plans else "shots", sim)
+        logger.info(f"--log: the record will be written to {a.log} (at a stop, and when the program ends)")
+    if a.script_plans:
+        a.script_plans = find_plans(a.script_plans, sim)  # a shot log by its name in logs/pingpong/ (logs/pingpong-sim/)
     if a.log and a.log.endswith(".json"):
         cfg.policy.record_shots = True
     if a.pelvis_stale_ms is not None:
         cfg.policy.pelvis_stale_s = a.pelvis_stale_ms / 1000.0
-    sim = bool(cfg.env.is_sim)
     for c in cfg.ctrl:
         if c.ctrl_type == "PingPongSimWorldCtrl":
             for k in ("balls", "env_idx", "n_shots", "random", "sensing", "opti_frame", "seed"):
@@ -410,6 +458,8 @@ def main():
         cfg.policy.noise = a.ball_noise_mm / 1000.0
     if a.compute_scale is not None:
         cfg.policy.compute_scale = a.compute_scale
+    if a.avoid_late is not None:
+        cfg.policy.avoid_late, cfg.policy.late_types = True, list(a.avoid_late) or ["forehand", "backhand"]
     if a.script_plans:
         cfg.policy.script_plans = a.script_plans
         for c in cfg.ctrl:
@@ -442,6 +492,33 @@ def main():
     ctrls = {c.inst.__class__.__name__: c.inst for c in pipeline.ctrl_manager.controllers.values()}
     sim_ctrl, perc = ctrls.get("PingPongSimWorldCtrl"), ctrls.get("PingPongPerceptionCtrl")
     lib, jmap = policy.rt.lib, policy.rt.jmap
+    rec = dict(t=[], pelvis_age=[], mode=[], tts=[], ok=[])
+    stop_reason, height = None, None
+
+    def build_log():
+        if not a.log.endswith(".json"):
+            return {k: list(v) for k, v in rec.items()}
+        meta = dict(config=a.config, sim=sim, dry_run=a.dry_run, checkpoint=str(cfg.policy.checkpoint), cam_hz=cfg.policy.cam_hz,
+                    date=time.strftime("%Y-%m-%d %H:%M:%S"), stop=stop_reason, n_busy=policy.rt.n_busy,
+                    ball_noise_m=cfg.policy.noise, racket_z_offset_m=cfg.policy.racket_z_offset,
+                    paddle_extra_mass_kg=getattr(cfg.env, "paddle_extra_mass", None) if sim else None,
+                    script_plans=cfg.policy.script_plans, manual_port=cfg.policy.manual_port,
+                    avoid_late=cfg.policy.late_types if cfg.policy.avoid_late else None,
+                    pelvis_check=height.report() if height is not None else None)
+        return dict(meta=meta, results=list(env.results) if sim else [], shots=list(policy.rt.shots))
+
+    run_log = RunLog(a.log, build_log) if a.log else None
+    on_hold = run_log.start if run_log else None
+
+    def leave(reason):
+        """An exit before the control loop: the log is still written (meta.stop says why), the motors are released."""
+        nonlocal stop_reason
+        stop_reason = reason
+        if run_log is not None and run_log.finish():
+            print(f"-> {a.log}")
+        env.shutdown()
+        return 1
+
     if sim:
         env.reset_to_ready(float(lib.ready_root_z[0]) + 0.016, lib.ready_root_quat[0], jmap.to_motor(lib.ready_q[0]),
                            xy=a.start_offset[:2], yaw_deg=a.start_offset[2])
@@ -463,12 +540,15 @@ def main():
                     env._draw_markers()
                     env.viewer.render()
 
-        m = perc.wait_for_pelvis(a.wait_perception, tick=tick)
+        try:
+            m = perc.wait_for_pelvis(a.wait_perception, tick=tick)
+        except KeyboardInterrupt:
+            logger.warning("Ctrl-C while waiting for perception: nothing was moved")
+            return leave("Ctrl-C while waiting for perception (no pelvis pose had arrived)")
         if m is None:
             logger.error(f"no pelvis pose from perception within {a.wait_perception:.0f} s: is run_perception.py running and sending to "
                          f"UDP {perc.rx.port}? Nothing was moved.")
-            env.shutdown()
-            return 1
+            return leave(f"no pelvis pose from perception within {a.wait_perception:.0f} s")
         src = perc.rx.last_addr
         msg = (f"perception is up ({'messages from ' + src[0] if src else ''}): pelvis at ({m.pelvis_pos[0]:+.3f}, {m.pelvis_pos[1]:+.3f}, "
                f"{m.pelvis_pos[2]:.3f}) m in the table frame, "
@@ -490,14 +570,13 @@ def main():
         triggers = dict(getattr(ustop.cfg_ctrl, "triggers", None) or {}) if ustop is not None else {}
         if not any(c in STOP_COMMANDS for c in triggers.values()):
             logger.error("no stop button on the remote (UnitreeCtrl triggers): refusing to apply torque")
-            env.shutdown()
-            return 1
+            return leave("no stop button on the remote (UnitreeCtrl triggers): refused to apply torque")
         try:
             prepare_watching_stops(pipeline, env, triggers, a.prepare_seconds)
         except (StopRequested, KeyboardInterrupt) as e:
-            hold_guard(pipeline, env, 1.0 / cfg.policy.freq, str(e) or "Ctrl-C during start-up")
-            env.shutdown()
-            return 1
+            reason = str(e) or "Ctrl-C during start-up"
+            hold_guard(pipeline, env, 1.0 / cfg.policy.freq, reason, on_hold)
+            return leave(f"{reason} (during the start-up ramp, before the control loop)")
     if sim and a.window:
         import mujoco
 
@@ -523,27 +602,12 @@ def main():
     timer.wrap(pipeline, "step", "whole control step")
 
     dt, n, n_stale, drops, t_wall0 = 1.0 / cfg.policy.freq, 0, 0, 0, time.perf_counter()
-    rec = dict(t=[], pelvis_age=[], mode=[], tts=[], ok=[])
     from collections import deque
 
     seen = deque(maxlen=a.stale_steps + 3)  # per step: perception messages so far, with the pelvis so far (the watchdog's diagnosis)
-    stop_reason = None
     n_reported = 0
     script_said = False
     t_next = time.perf_counter()
-
-    def build_log():
-        if not a.log.endswith(".json"):
-            return {k: list(v) for k, v in rec.items()}
-        meta = dict(config=a.config, sim=sim, dry_run=a.dry_run, checkpoint=str(cfg.policy.checkpoint), cam_hz=cfg.policy.cam_hz,
-                    date=time.strftime("%Y-%m-%d %H:%M:%S"), stop=stop_reason, n_busy=policy.rt.n_busy,
-                    ball_noise_m=cfg.policy.noise, racket_z_offset_m=cfg.policy.racket_z_offset,
-                    paddle_extra_mass_kg=getattr(cfg.env, "paddle_extra_mass", None) if sim else None,
-                    script_plans=cfg.policy.script_plans, manual_port=cfg.policy.manual_port)
-        return dict(meta=meta, results=list(env.results) if sim else [], shots=list(policy.rt.shots))
-
-    run_log = RunLog(a.log, build_log) if a.log else None
-    on_hold = run_log.start if run_log else None
     try:
         while True:
             pipeline.step(dry_run=a.dry_run)
@@ -568,6 +632,7 @@ def main():
                     if perc is not None and getattr(perc.rx, "jitter", None):
                         perc.rx.jitter.clear()
                 logger.info("[player] " + height.summary(last=50))
+                logger.info("[player] " + height.axes_summary(last=50))
             q, dq = env.dof_pos, env.dof_vel
             target = policy._hold if hasattr(policy, "_hold") else None
             if target is not None:
@@ -645,6 +710,7 @@ def main():
         timer.report(dt * 1000.0)
         monitor.report()
         logger.info("[player] " + height.summary())
+        logger.info("[player] " + height.axes_summary())
         if sim:
             R = env.results
             ret = sum(r["returned"] for r in R)

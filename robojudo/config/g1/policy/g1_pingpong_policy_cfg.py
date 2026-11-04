@@ -58,6 +58,8 @@ class PingPongPolicyCfg(PolicyCfg):
     cam_hz: float = 240.0
     noise: float = 0.001  # m per axis: the estimator's gate and fit weights
     latency: float = 0.010  # s from capture to the estimator (schedules the first plan job)
+    avoid_late: bool = False  # planner: a footwork step / stroke type that starts on time before a late swing (run_pingpong.py --avoid-late)
+    late_types: list[str] = []  # with avoid_late: for the balls late anyway, these stroke types first
     compute_scale: float = 1.0  # x the measured planner time (1 = this computer is the one that will run it); sim only
     threaded: bool = False  # estimator + planner jobs on a worker thread: True on the robot, so a 20 ms job never holds up the 50 Hz loop
     pelvis_extrapolate: bool = True  # carry the (10-30 ms old) mocap pelvis pose forward to the present
