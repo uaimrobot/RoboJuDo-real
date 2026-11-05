@@ -208,6 +208,20 @@ known delay (20 ms recovered within 0-3 ms; a stuck joint with and without the m
 blip does not; the guard stop runs), and MuJoCo with 20 ms added to every motor (first motion +20 ms as the median, 13 of 17 joints within
 3 ms; the shoulders read 10-18 ms low: they are still settling from the last step). The torque columns have not run on the robot yet.
 
+**The planner's paddle restitution (`--planner-e`).** The planner assumes 0.65 by default (`PingPongPolicyCfg.planner_paddle_e`, robot and
+simulation); `--planner-e 0.74` overrides it for a run. The simulated ball keeps `ball.yaml`'s 0.74 (a 30 cm drop test, 2.4 m/s); the robot's returns
+on 2026-11-04 fit about 0.56 at 3.3 m/s, and 0.65 lies between. In simulation (256 balls each, returned / net): ball 0.56 with planner 0.74: 41 % / 36 %; planner 0.65: 66 % / 24 %; planner 0.56: 89 % /
+4 %; ball 0.74 with planner 0.65: 86 % / 2 %; planner 0.56: 67 % / 0; planner 0.74: 91 % / 2 %. A policy follows only the racket speeds it was trained
+on: staged_fix8 covers 0.56-0.74.
+
+**Two policies (2026-11-04).** The default stays fix6 @16500 (`assets/motions/g1/pingpong_play`); fix8 @16000 is `--checkpoint
+assets/motions/g1/pingpong_play_fix8/model_16000.pt` (trained on the measured numbers, friction and racket speeds; needs
+`targets_mixfix_aim_mixspin_mixe.npz` from pingpong). In simulation they tie where the robot's friction is modelled (Isaac 86.9 / 86.3 %, net 5.6 / 3.2 %,
+racket 43 / 39 mm); fix8 has the calmer feet (slide p95 0.060 vs 0.081 m/s) and loses 3 points on the low-friction standard test. Only the robot can tell.
+
+**Bad pelvis frames.** `pingpong/deploy/pelvis_gate.py` leaves out pelvis samples further from the last good one than the pelvis can have moved (up to
+6 in a row, so a real jump gets through in 29 ms). The log's `meta.pelvis_gate` counts them. The player's pelvis-too-low stop is unchanged.
+
 **B7a. Pelvis pivot (do it at the first floor stand).** Motive's pivot of the pelvis rigid body is where Motive put it (the markers'
 centre unless moved), not the pelvis origin the policy was trained with; every target the policy sees is measured from the pelvis, so
 an offset shifts them all. In simulation a pivot 10 cm low cut the returns from 100 % to 42 % (64 balls; corrected: 98 %). The player

@@ -1,0 +1,50 @@
+seed: 7
+num_steps_per_env: 24
+max_iterations: 6000
+save_interval: 500
+experiment_name: staged_fix8/stage4_robust_gait
+run_name: stage4-fix8-7
+logger: wandb
+wandb_project: humanoid-pingpong-version-0
+check_for_nan: true
+obs_groups:
+  actor:
+  - policy
+  critic:
+  - critic
+actor:
+  class_name: MLPModel
+  hidden_dims:
+  - 512
+  - 256
+  - 128
+  activation: elu
+  obs_normalization: true
+  distribution_cfg:
+    class_name: GaussianDistribution
+    init_std: 1.0
+    std_type: scalar
+critic:
+  class_name: MLPModel
+  hidden_dims:
+  - 512
+  - 256
+  - 128
+  activation: elu
+  obs_normalization: true
+algorithm:
+  class_name: PPO
+  value_loss_coef: 1.0
+  use_clipped_value_loss: true
+  clip_param: 0.2
+  entropy_coef: 0.005
+  num_learning_epochs: 5
+  num_mini_batches: 4
+  learning_rate: 0.001
+  schedule: adaptive
+  gamma: 0.99
+  lam: 0.95
+  desired_kl: 0.01
+  max_grad_norm: 1.0
+  rnd_cfg: null
+  symmetry_cfg: null

@@ -419,6 +419,8 @@ def main():
     ap.add_argument("--manual-host", type=str, default=None, help="the interface --manual listens on (default 127.0.0.1; 0.0.0.0 for "
                     "a console on another computer)")
     ap.add_argument("--compute-scale", type=float, default=None, help="x the measured planner time (0 = instant)")
+    ap.add_argument("--planner-e", type=float, default=None, help="the paddle restitution the planner assumes (default: PingPongPolicyCfg's 0.65); "
+                    "the policy must have been trained on it (staged_fix8: 0.56-0.74)")
     ap.add_argument("--avoid-late", nargs="*", default=None, metavar="TYPE",
                     help="planner: a footwork step or another stroke type that starts on time before a late swing; the stroke types "
                     "given (default: forehand backhand) first for the balls that are late anyway")
@@ -459,6 +461,8 @@ def main():
         cfg.policy.noise = a.ball_noise_mm / 1000.0
     if a.compute_scale is not None:
         cfg.policy.compute_scale = a.compute_scale
+    if a.planner_e is not None:
+        cfg.policy.planner_paddle_e = a.planner_e
     if a.avoid_late is not None:
         cfg.policy.avoid_late, cfg.policy.late_types = True, list(a.avoid_late) or ["forehand", "backhand"]
     if a.script_plans:
@@ -499,13 +503,15 @@ def main():
     def build_log():
         if not a.log.endswith(".json"):
             return {k: list(v) for k, v in rec.items()}
+        gate = getattr(policy.rt, "pelvis_gate", None)  # (a pingpong package older than the gate has none)
         meta = dict(config=a.config, sim=sim, dry_run=a.dry_run, checkpoint=str(cfg.policy.checkpoint), cam_hz=cfg.policy.cam_hz,
                     date=time.strftime("%Y-%m-%d %H:%M:%S"), stop=stop_reason, n_busy=policy.rt.n_busy,
                     ball_noise_m=cfg.policy.noise, racket_z_offset_m=cfg.policy.racket_z_offset,
                     paddle_extra_mass_kg=getattr(cfg.env, "paddle_extra_mass", None) if sim else None,
                     script_plans=cfg.policy.script_plans, manual_port=cfg.policy.manual_port,
-                    avoid_late=cfg.policy.late_types if cfg.policy.avoid_late else None,
-                    pelvis_check=height.report() if height is not None else None)
+                    avoid_late=cfg.policy.late_types if cfg.policy.avoid_late else None, planner_e=cfg.policy.planner_paddle_e,
+                    pelvis_check=height.report() if height is not None else None,
+                    pelvis_gate=dict(refused=gate.n_refused_total, forced=gate.n_forced) if gate is not None else None)
         return dict(meta=meta, results=list(env.results) if sim else [], shots=list(policy.rt.shots))
 
     run_log = RunLog(a.log, build_log) if a.log else None

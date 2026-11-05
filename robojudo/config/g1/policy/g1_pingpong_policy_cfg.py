@@ -59,6 +59,8 @@ class PingPongPolicyCfg(PolicyCfg):
     noise: float = 0.001  # m per axis: the estimator's gate and fit weights
     latency: float = 0.010  # s from capture to the estimator (schedules the first plan job)
     avoid_late: bool = False  # planner: a footwork step / stroke type that starts on time before a late swing (run_pingpong.py --avoid-late)
+    planner_paddle_e: float | None = 0.65  # the paddle restitution the planner assumes (--planner-e); None: ball.yaml's. Between the drop test's
+    # 0.74 and the robot's returns' 0.56 (2026-11-04): in simulation it holds up whichever of the two is real
     late_types: list[str] = []  # with avoid_late: for the balls late anyway, these stroke types first
     compute_scale: float = 1.0  # x the measured planner time (1 = this computer is the one that will run it); sim only
     threaded: bool = False  # estimator + planner jobs on a worker thread: True on the robot, so a 20 ms job never holds up the 50 Hz loop

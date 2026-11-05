@@ -36,7 +36,8 @@ class PingPongPolicy(Policy):
         rcfg = RuntimeConfig(dt=1.0 / c.freq, cam_hz=c.cam_hz, noise=c.noise, latency=c.latency, compute_scale=c.compute_scale, threaded=c.threaded,
                              pelvis_extrapolate=c.pelvis_extrapolate, pelvis_timeout=c.pelvis_stale_s, ball=c.ball, record_shots=c.record_shots,
                              racket_z_offset=c.racket_z_offset, script_plans=c.script_plans,
-                             manual_port=c.manual_port, manual_host=c.manual_host, avoid_late=c.avoid_late, late_types=tuple(c.late_types))
+                             manual_port=c.manual_port, manual_host=c.manual_host, avoid_late=c.avoid_late, late_types=tuple(c.late_types),
+                             planner_paddle_e=c.planner_paddle_e)
         self.rt = PingPongRuntime(c.checkpoint, None, rcfg, actor_path=c.actor_path, seed=c.seed)
         if list(self.rt.lib.joint_names) != list(c.obs_dof.joint_names):
             raise ValueError("the swing library's joint order differs from PingPongPolicyCfg.obs_dof (the checkpoint's run changed?)")
